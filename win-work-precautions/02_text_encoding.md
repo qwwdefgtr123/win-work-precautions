@@ -1,0 +1,58 @@
+# 02 文本编码（Text & Encoding）
+
+> 优先级 🔴 核心必读。Windows 上"脚本静默不执行"、"中文变乱码"、"枚举返回空"的
+> 第一嫌疑人都是编码，而不是逻辑。本文规定写文件、跑脚本、读输出三层的强制规则。
+
+## 落盘编码规则（写文件时）
+
+- **`.ps1`**：内容要么纯 ASCII，要么存成 **UTF-8 带 BOM**。
+  Windows PowerShell 5.1 对无 BOM 文件按系统 ANSI 代码页（中文环境 GBK）解码，
+  UTF-8 中文会被读成乱码并打乱引号/括号配对，轻则 ParserError，
+  重则**整脚本静默返空且不报错**（实测枚举目录返回 total=0）。
+- **`.bat` / `.cmd`**：内容**必须纯 ASCII**，且行尾用 **CRLF**。
+  cmd 按代码页逐字节解析，UTF-8 多字节中文会污染命令边界（连 `rem` 都被啃掉首字母）；
+  LF 换行会导致解析错位（报"文件名、目录名或卷标语法不正确"）。
+  需要输出中文时改用 `chcp 65001` 或让被调用的 Python 打印中文。
+- 若生成工具默认写入 BOM 而目标是 `.bat`/`.sh`（BOM 会毁掉首行 `@echo off`/shebang），
+  Then 用无 BOM 方式重写并校验首字节。反之 PowerShell 5.1 脚本必须带 BOM：**按目标解释器决定，别一刀切**。
+- Python 脚本开头统一加 `sys.stdout.reconfigure(encoding="utf-8")`（管道下 stdout 默认走 ANSI 代码页，
+  会把已解码好的中文再编成乱码）。
+
+## 路径字面量规则
+
+- If 在 Python/其他语言的**非 raw 字符串**里写 Windows 路径，Then 必用 `r'...'`、`\\` 或正斜杠。
+  `\a` `\b` `\0` `\U` 会被当转义静默吃掉或报 `SyntaxError: truncated \UXXXXXXXX`，
+  路径报废且不留明显错误（典型表现：形如 `<数据盘>:\tools\bin` 的路径落地后变成夹带 BEL/退格控制字符的垃圾串）。
+- If 生成含反斜杠路径的文本（脚本、配置、文档），Then 用 raw 串或占位符 replace 生成，
+  并回查是否残留控制字符。
+- 脚本与目录名尽量用 ASCII：中文文件名在部分调用链（提权传参、权限提升工具、计划任务命令行）
+  会被截断或坏码。If 必须提权运行含非 ASCII 路径的脚本，Then 先把脚本、可执行文件与输出
+  统一放到纯 ASCII 目录下再调用，这是通用规避手段。
+- If 脚本可能与标准库/第三方包同目录存放，Then 文件名永远避开标准库名
+  （`inspect.py`、`json.py`、`types.py`、`logging.py` 等），否则会遮蔽标准库、
+  表现为"输出串台/幽灵输出"这类极难定位的故障。
+
+## 读文件与读输出的解码顺序
+
+1. 先看字节：`raw.startswith(b'\xff\xfe')` 或 `b'\x00' in raw[:20]` → 按 UTF-16LE 解；
+   `raw.startswith(b'\xef\xbb\xbf')` → 用 `utf-8-sig`。
+2. 部分命令行工具（尤其调试/系统类工具）输出常是 UTF-16LE：按 GBK/UTF-8 解会得到
+   字符间夹空格的花屏文本，写文件还会因含 NUL 被判为二进制。
+   → 若输出是"含零星 NUL 的混合文本"，不要整份按 UTF-16 解；`replace(b'\x00', b'')` 后按 UTF-8 解。
+3. 网络/系统类命令（`netstat`、`tasklist`、`ipconfig`、`fsutil` 等）输出常是 ANSI 代码页字节：
+   `subprocess` 取回的 bytes 直接 `.decode()` 会 `UnicodeDecodeError`
+   → 用 `.decode(codec, 'replace')`，codec 取自 `00` 探测到的系统 ANSI 代码页。
+4. `cmd`/`powershell` 重定向落地的文件编码随解释器不同：PS 的 `>` 默认 UTF-16LE（5.1）或
+   UTF-8（7 默认无 BOM），`Out-File -Encoding utf8` 在 5.1 下是**带 BOM 的 UTF-8**，
+   按 `utf-16` 读会中途崩。→ 读取前先做第 1 步嗅探。
+5. 读 hosts 等系统文本用 `utf-8-sig`（可能带 BOM，否则版权行会被误判成数据行）。
+
+## 修复位置原则
+
+- If 出现乱码，Then 先分层定位：文件层（脚本本身编码错）/ 管道层（stdout 编码）/ 控制台层（显示）。
+  **修复位置永远在数据入口**（读取时指定正确 codec），不要在链路上反复转码——
+  每多一次错误转码，数据就永久丢失一次（不可逆）。
+- If 校验文本编码是否正确，Then 不能只断言"字节是合法 UTF-8"：合法 UTF-8 也可能已被悄悄替换
+  （实测某 UTF-8 校验逻辑漏判前导字节条件，静默打坏 51% 常用汉字）。
+  必须做**往返一致性断言**：对已知样本 `decode(encode(s)) == s`，并核对具体字符是否原样存在。
+- 结论判定只认落盘文件 + 结构化解析（如 JSON 逐字段核对），绝不靠终端回显。
